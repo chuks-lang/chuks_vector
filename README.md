@@ -225,7 +225,7 @@ var norm = vector.normalize(vec)
 ## Full RAG Example
 
 ```chuks
-import { embed } from "pkg//embed"
+import { embed } from "pkg/@chuks/embed"
 import { vector } from "pkg/@chuks/vector"
 
 // Create the store
