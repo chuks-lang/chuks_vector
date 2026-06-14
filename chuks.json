@@ -1,6 +1,6 @@
 {
   "name": "@chuks/vector",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Embedded vector store for Chuks — in-memory and persistent vector search with parallel comparison via spawn, thread-safe, no external infrastructure needed",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
