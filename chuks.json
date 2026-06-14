@@ -1,0 +1,10 @@
+{
+  "name": "@chuks/vector",
+  "version": "1.0.0",
+  "description": "Embedded vector store for Chuks — in-memory and persistent vector search with parallel comparison via spawn, thread-safe, no external infrastructure needed",
+  "entry": "src/index.chuks",
+  "author": "Chuks Team",
+  "license": "MIT",
+  "keywords": ["vector", "embedding", "search", "similarity", "rag", "parallel", "persistent", "in-memory", "cosine", "euclidean"],
+  "repository": "https://github.com/chuks-lang/chuks_vector"
+}

@@ -1,0 +1,596 @@
+// ┌─────────────────────────────────────────────────────────────────┐
+// │  chuks_vector — Embedded Vector Store                            │
+// │                                                                 │
+// │  Pure Chuks in-memory + persistent vector store.                │
+// │  No external infrastructure — lives in your binary.             │
+// │                                                                 │
+// │  Parallel vector comparison via spawn + typed channels.         │
+// │  On a 16-core machine, search scans 16 partitions at once.      │
+// │                                                                 │
+// │  Thread-safe (@threadSafe): mutations are guarded by lock(this) │
+// │  and search runs on a consistent point-in-time snapshot.        │
+// └─────────────────────────────────────────────────────────────────┘
+
+import { fs } from "std/fs"
+import { json } from "std/json"
+import { Channel } from "std/channel"
+import { math } from "std/math"
+
+// ─── Public Types ───────────────────────────────────────────────
+
+// Configuration for a vector store. `dimensions` is required; the rest
+// are optional and hydrate from a map literal:
+//   vector.create({ dimensions: 1536, metric: "cosine", persist: "./v.db" })
+dataType VectorConfig {
+    dimensions: int;
+    metric: string?;
+    persist: string?;
+    workers: int?;
+}
+
+// Options for a search call. All fields optional.
+dataType SearchOptions {
+    topK: int?;
+    minScore: float?;
+    filter: ((any) => bool)?;
+}
+
+// Options for listing entries.
+dataType ListOptions {
+    offset: int?;
+    limit: int?;
+}
+
+// A single search hit. `metadata` is intentionally `any` — it is arbitrary
+// user-attached data and is genuinely heterogeneous.
+dataType SearchResult {
+    id: string;
+    score: float;
+    metadata: any;
+}
+
+dataType StoreStats {
+    count: int;
+    dimensions: int;
+    metric: string;
+    persistent: bool;
+}
+
+// Item shape for get / batch upsert.
+dataType VectorItem {
+    id: string;
+    vector: []float;
+    metadata: any;
+}
+
+// Result returned by an entry listing.
+dataType ListEntry {
+    id: string;
+    metadata: any;
+}
+
+// Internal: a worker's partial results, carried over the typed channel.
+dataType WorkerMsg {
+    workerIdx: int;
+    results: []SearchResult;
+}
+
+// ─── Distance Metrics ───────────────────────────────────────────
+
+// Cosine similarity: dot(a,b) / (||a|| * ||b||). Range -1..1; 1 = identical.
+function _cosine(a: []float, b: []float, len: int): float {
+    var dot: float = 0.0
+    var magA: float = 0.0
+    var magB: float = 0.0
+    var i: int = 0
+    while (i < len) {
+        dot = dot + a[i] * b[i]
+        magA = magA + a[i] * a[i]
+        magB = magB + b[i] * b[i]
+        i = i + 1
+    }
+    var denom: float = math.sqrt(magA) * math.sqrt(magB)
+    if (denom == 0.0) { return 0.0 }
+    return dot / denom
+}
+
+// Euclidean similarity: 1 / (1 + distance). Range 0..1; 1 = identical.
+function _euclidean(a: []float, b: []float, len: int): float {
+    var sum: float = 0.0
+    var i: int = 0
+    while (i < len) {
+        var diff: float = a[i] - b[i]
+        sum = sum + diff * diff
+        i = i + 1
+    }
+    return 1.0 / (1.0 + math.sqrt(sum))
+}
+
+// Dot product similarity (for pre-normalized vectors). Higher = more similar.
+function _dot(a: []float, b: []float, len: int): float {
+    var result: float = 0.0
+    var i: int = 0
+    while (i < len) {
+        result = result + a[i] * b[i]
+        i = i + 1
+    }
+    return result
+}
+
+function _score(query: []float, vec: []float, metric: string, dims: int): float {
+    if (metric == "euclidean") { return _euclidean(query, vec, dims) }
+    if (metric == "dot") { return _dot(query, vec, dims) }
+    return _cosine(query, vec, dims)
+}
+
+// ─── Search Worker (top-level async for spawn) ──────────────────
+// Scores a partition of the snapshot and sends its results to the channel.
+
+async function _searchWorker(
+    query: []float,
+    vectors: [][]float,
+    ids: []string,
+    metadata: []any,
+    startIdx: int,
+    count: int,
+    metric: string,
+    dims: int,
+    ch: Channel<WorkerMsg>,
+    workerIdx: int
+): Task<void> {
+    var results: []SearchResult = []
+    var i: int = 0
+    while (i < count) {
+        var s: float = _score(query, vectors[startIdx + i], metric, dims)
+        results.push({ id: ids[startIdx + i], score: s, metadata: metadata[startIdx + i] })
+        i = i + 1
+    }
+    var msg: WorkerMsg = { workerIdx: workerIdx, results: results }
+    ch.send(msg)
+    return
+}
+
+// ─── Scoring helper (sequential range) ──────────────────────────
+
+function _scoreRange(
+    query: []float,
+    vectors: [][]float,
+    ids: []string,
+    metadata: []any,
+    count: int,
+    metric: string,
+    dims: int
+): []SearchResult {
+    var results: []SearchResult = []
+    var i: int = 0
+    while (i < count) {
+        var s: float = _score(query, vectors[i], metric, dims)
+        results.push({ id: ids[i], score: s, metadata: metadata[i] })
+        i = i + 1
+    }
+    return results
+}
+
+// ─── VectorStore ────────────────────────────────────────────────
+// The main store. Created via vector.create(config).
+//
+//   var store = vector.create({ dimensions: 1536, metric: "cosine" })
+//   store.upsert("doc1", vec1, { title: "Hello" })
+//   var results = await store.search(queryVec, { topK: 5 })
+
+@threadSafe
+export class VectorStore {
+    var _ids: []string = []
+    var _vectors: [][]float = []
+    var _metadata: []any = []
+    var _dimensions: int = 0
+    var _metric: string = "cosine"
+    var _persistPath: string = ""
+    var _workers: int = 8
+
+    constructor(config: VectorConfig?) {
+        if (config != null) {
+            this._dimensions = config.dimensions
+            if (config.metric != null) { this._metric = config.metric }
+            if (config.persist != null) { this._persistPath = config.persist }
+            if (config.workers != null) { this._workers = config.workers }
+        }
+
+        if (this._persistPath != "") {
+            if (fs.exists(this._persistPath)) {
+                this._load()
+            }
+        }
+    }
+
+    // ── Upsert: insert or update a vector ───────────────────
+    public upsert(id: string, vec: []float, meta: any): void {
+        if (vec.length != this._dimensions) {
+            println("chuks_vector: dimension mismatch — expected " + string(this._dimensions) + ", got " + string(vec.length))
+            return
+        }
+        // Defensive value-copy: the caller cannot mutate stored data afterwards,
+        // and it keeps a clean `[]float` value (not a parameter reference) for storage.
+        var v: []float = []
+        var k: int = 0
+        while (k < vec.length) {
+            v.push(vec[k])
+            k = k + 1
+        }
+        lock(this) {
+            var idx: int = this._findIndex(id)
+            if (idx >= 0) {
+                this._vectors[idx] = v
+                this._metadata[idx] = meta
+            } else {
+                this._ids.push(id)
+                this._vectors.push(v)
+                this._metadata.push(meta)
+            }
+        }
+    }
+
+    // ── Batch upsert ────────────────────────────────────────
+    public upsertBatch(items: []VectorItem): void {
+        var i: int = 0
+        while (i < items.length) {
+            var item: VectorItem = items[i]
+            this.upsert(item.id, item.vector, item.metadata)
+            i = i + 1
+        }
+    }
+
+    // ── Get a vector by ID ──────────────────────────────────
+    public get(id: string): VectorItem? {
+        var out: VectorItem? = null
+        lock(this) {
+            var idx: int = this._findIndex(id)
+            if (idx >= 0) {
+                var it: VectorItem = {
+                    id: this._ids[idx],
+                    vector: this._vectors[idx],
+                    metadata: this._metadata[idx],
+                }
+                out = it
+            }
+        }
+        return out
+    }
+
+    // ── Delete a vector by ID ───────────────────────────────
+    public delete(id: string): bool {
+        var ok: bool = false
+        lock(this) {
+            var idx: int = this._findIndex(id)
+            if (idx >= 0) {
+                // Swap with last element and pop (O(1) removal).
+                var last: int = this._ids.length - 1
+                if (idx != last) {
+                    this._ids[idx] = this._ids[last]
+                    this._vectors[idx] = this._vectors[last]
+                    this._metadata[idx] = this._metadata[last]
+                }
+                this._ids.pop()
+                this._vectors.pop()
+                this._metadata.pop()
+                ok = true
+            }
+        }
+        return ok
+    }
+
+    // ── Has: check if an ID exists ──────────────────────────
+    public has(id: string): bool {
+        var found: bool = false
+        lock(this) {
+            found = this._findIndex(id) >= 0
+        }
+        return found
+    }
+
+    // ── Count ───────────────────────────────────────────────
+    public count(): int {
+        var n: int = 0
+        lock(this) {
+            n = this._ids.length
+        }
+        return n
+    }
+
+    // ── Stats ───────────────────────────────────────────────
+    public stats(): StoreStats {
+        var s: StoreStats = { count: 0, dimensions: this._dimensions, metric: this._metric, persistent: this._persistPath != "" }
+        lock(this) {
+            s.count = this._ids.length
+        }
+        return s
+    }
+
+    // ── List entries (optional offset/limit) ────────────────
+    public list(options: ListOptions?): []ListEntry {
+        var results: []ListEntry = []
+        lock(this) {
+            var offset: int = 0
+            var limit: int = this._ids.length
+            if (options != null) {
+                if (options.offset != null) { offset = options.offset }
+                if (options.limit != null) { limit = options.limit }
+            }
+            var i: int = offset
+            if (i < 0) { i = 0 }
+            var end: int = offset + limit
+            if (end > this._ids.length) { end = this._ids.length }
+            while (i < end) {
+                results.push({ id: this._ids[i], metadata: this._metadata[i] })
+                i = i + 1
+            }
+        }
+        return results
+    }
+
+    // ── Search: parallel vector comparison ──────────────────
+    //   var results = await store.search(queryVec, { topK: 5 })
+    //   results[0].id       // most similar document
+    //   results[0].score    // similarity score (float)
+    //   results[0].metadata // attached metadata
+    public async search(query: []float, options: SearchOptions?): Task<[]SearchResult> {
+        var topK: int = 10
+        var minScore: float? = null
+        var filter: ((any) => bool)? = null
+        if (options != null) {
+            if (options.topK != null) { topK = options.topK }
+            if (options.minScore != null) { minScore = options.minScore }
+            if (options.filter != null) { filter = options.filter }
+        }
+
+        // Consistent snapshot — a search never observes a half-applied write.
+        // Vectors are replaced (not mutated) on upsert, so a shallow copy of
+        // the outer arrays under a short lock is a correct point-in-time view.
+        var ids: []string = []
+        var vectors: [][]float = []
+        var metadata: []any = []
+        lock(this) {
+            var si: int = 0
+            while (si < this._ids.length) {
+                ids.push(this._ids[si])
+                vectors.push(this._vectors[si])
+                metadata.push(this._metadata[si])
+                si = si + 1
+            }
+        }
+        var total: int = ids.length
+        if (total == 0) { return [] }
+
+        var allResults: []SearchResult = []
+
+        // For small stores, sequential scan beats spawn overhead.
+        if (total <= 500) {
+            allResults = _scoreRange(query, vectors, ids, metadata, total, this._metric, this._dimensions)
+        } else {
+            var workers: int = this._workers
+            if (workers > total) { workers = total }
+            var chunkSize: int = total / workers
+            var remainder: int = total - chunkSize * workers
+            var ch: Channel<WorkerMsg> = new Channel<WorkerMsg>(workers)
+
+            var wi: int = 0
+            var offset: int = 0
+            while (wi < workers) {
+                var thisChunk: int = chunkSize
+                if (wi < remainder) { thisChunk = thisChunk + 1 }
+                spawn _searchWorker(query, vectors, ids, metadata, offset, thisChunk, this._metric, this._dimensions, ch, wi)
+                offset = offset + thisChunk
+                wi = wi + 1
+            }
+
+            var collected: int = 0
+            while (collected < workers) {
+                var msg: WorkerMsg? = ch.receive()
+                if (msg == null) { break }
+                var ri: int = 0
+                while (ri < msg.results.length) {
+                    allResults.push(msg.results[ri])
+                    ri = ri + 1
+                }
+                collected = collected + 1
+            }
+            ch.close()
+        }
+
+        // Apply minScore + filter.
+        var filtered: []SearchResult = []
+        var fi: int = 0
+        while (fi < allResults.length) {
+            var item: SearchResult = allResults[fi]
+            var keep: bool = true
+            if (minScore != null) {
+                if (item.score < minScore) { keep = false }
+            }
+            if (keep && filter != null) {
+                if (!filter(item.metadata)) { keep = false }
+            }
+            if (keep) { filtered.push(item) }
+            fi = fi + 1
+        }
+
+        _sortByScore(filtered)
+        return _topK(filtered, topK)
+    }
+
+    // ── Save to disk ────────────────────────────────────────
+    public save(): bool {
+        if (this._persistPath == "") { return false }
+        var ok: bool = false
+        lock(this) {
+            var data: any = {
+                "dimensions": this._dimensions,
+                "metric": this._metric,
+                "count": this._ids.length,
+                "ids": this._ids,
+                "vectors": this._vectors,
+                "metadata": this._metadata,
+            }
+            ok = fs.writeFile(this._persistPath, json.stringify(data))
+        }
+        return ok
+    }
+
+    // ── Load from disk (parsed JSON is genuinely dynamic) ────
+    // Parsed JSON is genuinely dynamic; parse it explicitly, element by element,
+    // so the round-trip is identical under both the VM and AOT backends.
+    _load(): void {
+        var raw: string? = fs.readFile(this._persistPath)
+        if (raw == null) { return }
+        var parsed: any = json.parse(raw)
+        if (parsed == null) { return }
+        var data: any = parsed
+        var persistedDims: int = data.dimensions
+        if (persistedDims != this._dimensions) {
+            println("chuks_vector: persisted dimensions (" + string(persistedDims) + ") don't match configured (" + string(this._dimensions) + ")")
+            return
+        }
+        var ids: any = data.ids
+        var vectors: any = data.vectors
+        var metadata: any = data.metadata
+        var n: int = data.count
+        var i: int = 0
+        while (i < n) {
+            var idv: string = string(ids[i])
+            var rowAny: any = vectors[i]
+            var dim: int = rowAny.length
+            var vv: []float = []
+            var d: int = 0
+            while (d < dim) {
+                var f: float = rowAny[d]
+                vv.push(f)
+                d = d + 1
+            }
+            this._ids.push(idv)
+            this._vectors.push(vv)
+            this._metadata.push(metadata[i])
+            i = i + 1
+        }
+    }
+
+    // ── Clear all vectors ───────────────────────────────────
+    public clear(): void {
+        lock(this) {
+            this._ids = []
+            this._vectors = []
+            this._metadata = []
+        }
+    }
+
+    // ── Find index by ID (linear scan; caller holds the lock) ─
+    _findIndex(id: string): int {
+        var i: int = 0
+        while (i < this._ids.length) {
+            if (this._ids[i] == id) { return i }
+            i = i + 1
+        }
+        return -1
+    }
+}
+
+// ─── Sorting Utility ────────────────────────────────────────────
+// Insertion sort by score descending.
+
+function _sortByScore(arr: []SearchResult): void {
+    var si: int = 1
+    while (si < arr.length) {
+        var current: SearchResult = arr[si]
+        var sj: int = si - 1
+        var sorting: bool = true
+        while (sorting) {
+            if (sj < 0) {
+                sorting = false
+            } else {
+                if (arr[sj].score < current.score) {
+                    arr[sj + 1] = arr[sj]
+                    sj = sj - 1
+                } else {
+                    sorting = false
+                }
+            }
+        }
+        arr[sj + 1] = current
+        si = si + 1
+    }
+}
+
+// ─── TopK Utility ───────────────────────────────────────────────
+
+function _topK(arr: []SearchResult, k: int): []SearchResult {
+    var results: []SearchResult = []
+    var i: int = 0
+    while (i < k) {
+        if (i >= arr.length) { return results }
+        results.push(arr[i])
+        i = i + 1
+    }
+    return results
+}
+
+// ─── VectorModule ───────────────────────────────────────────────
+//   import { vector } from "pkg/@chuks/vector"
+//   var store = vector.create({ dimensions: 1536, metric: "cosine" })
+
+class VectorModule {
+
+    // ── Create a new vector store ───────────────────────────
+    public create(config: VectorConfig?): VectorStore {
+        return new VectorStore(config)
+    }
+
+    // ── Cosine similarity between two vectors ───────────────
+    public similarity(a: []float, b: []float): float {
+        return _cosine(a, b, a.length)
+    }
+
+    // ── Euclidean similarity ────────────────────────────────
+    public euclidean(a: []float, b: []float): float {
+        return _euclidean(a, b, a.length)
+    }
+
+    // ── Dot product ─────────────────────────────────────────
+    public dotProduct(a: []float, b: []float): float {
+        return _dot(a, b, a.length)
+    }
+
+    // ── Normalize a vector to unit length ───────────────────
+    public normalize(vec: []float): []float {
+        var magnitude: float = 0.0
+        var i: int = 0
+        var len: int = vec.length
+        while (i < len) {
+            magnitude = magnitude + vec[i] * vec[i]
+            i = i + 1
+        }
+        magnitude = math.sqrt(magnitude)
+        if (magnitude == 0.0) { return vec }
+        var result: []float = []
+        var j: int = 0
+        while (j < len) {
+            result.push(vec[j] / magnitude)
+            j = j + 1
+        }
+        return result
+    }
+}
+
+// ─── Singleton Export ───────────────────────────────────────────
+
+const vector = new VectorModule()
+
+export {
+    vector,
+    VectorModule,
+    VectorStore,
+    VectorConfig,
+    SearchOptions,
+    ListOptions,
+    SearchResult,
+    StoreStats,
+    VectorItem,
+    ListEntry,
+}
